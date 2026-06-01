@@ -1,13 +1,14 @@
 # WebGL MP3 Visualizer
 
 A single-file, near-zero-build, fully-local browser app: drop MP3 files onto
-the page, get a playlist plus six audio-reactive WebGL effects driven by the
-Web Audio API. Optionally point it at a folder of images and the **Photos**
-effect runs them as a beat-aware slideshow. Audio decode and image rendering
-all happen client-side; nothing is uploaded.
+the page, get a playlist plus six audio-reactive WebGL effects. Playback uses
+a native HTML audio element, while separate client-side analysis drives the
+visuals. Optionally point it at a folder of images and the **Photos** effect
+runs them as a beat-aware slideshow. Audio analysis and image rendering all
+happen client-side; nothing is uploaded.
 
-Just open `index.html`. The page loads [Howler.js](https://howlerjs.com/) and
-[Three.js](https://threejs.org/) from a CDN; no build step otherwise.
+Just open `index.html`. The page loads [Three.js](https://threejs.org/) from
+a CDN for the Trails Stream effect; no build step otherwise.
 
 The app branding (page title, header label, favicon) lives inline near the
 top of `index.html` — change it there to make it your own.
@@ -32,10 +33,14 @@ project → Custom domains).
 Drag MP3 files anywhere on the page (or click "Choose MP3 files" on the welcome
 card / the "Drop .mp3 files anywhere" hint in the header).
 
-Playback is handled by [Howler.js](https://howlerjs.com/) on the Web Audio
-path (`html5: false`). Howler manages the AudioContext lifecycle, mobile / iOS
-audio unlock, and recovery from cross-tab audio focus interruptions, so the
-app doesn't need to maintain those workarounds itself.
+Playback is handled by a native `HTMLAudioElement`. The audible path never
+routes through Web Audio, so browser-level `AudioContext` output failures
+cannot silence playback. When the browser supports media-element capture, a
+separate analyser reads a captured stream from the native element for live
+visuals without connecting that graph to speakers. If live capture is not
+available, visuals start from a lightweight preview signal immediately, then
+use MP3-frame preview data when it is ready. A decoded time-domain pass still
+supplies beat data and a fallback envelope.
 
 ### Controls
 
@@ -153,17 +158,19 @@ while dragging a playlist row so the HUD stays visible mid-reorder.
 
 ## Implementation notes
 
-Everything (apart from the Howler.js and Three.js CDN loads) is in
+Everything (apart from the Three.js CDN load used by Trails Stream) is in
 `index.html` — vanilla JS modules, no build, no other deps.
 
-- A 2D fragment shader pipeline driven by an FFT spectrum texture (256 bins,
-  uploaded each frame from a Web Audio `AnalyserNode`). The Trails Stream
-  effect is the one exception: it's a Three.js scene with its own
-  EffectComposer pipeline (bloom + selective bottom blur) loaded lazily on
-  first activation.
-- The analyser is spliced between `Howler.masterGain` and the `AudioContext`
-  destination once, so the visualizer reads frequency data from whatever
-  Howler is playing without each track needing its own wiring.
+- A 2D fragment shader pipeline driven by a 256-bin spectrum texture. In normal
+  operation that texture comes from a live capture analyser attached to the
+  native audio element. The Trails Stream effect is the one exception: it's a
+  Three.js scene with its own EffectComposer pipeline (bloom + selective bottom
+  blur) loaded lazily on first activation.
+- Playback and visuals are intentionally decoupled. The native audio element
+  owns sound output; Web Audio only analyzes captured or decoded data and is
+  never connected to the audible output path. When live capture is not
+available, a procedural/MP3-frame preview starts the visual motion right away,
+  and a later decoded envelope pass estimates RMS, flux, and beats.
 - Per-frame shader uniforms include `uBass`, `uMid`, `uHi`, `uLevel` (smoothed
   bands), plus `uBeat` (transient envelope), `uBeatT` (seconds since last
   beat) and `uPulse` — a velocity-based clock that surges on beats, used by
@@ -173,15 +180,11 @@ Everything (apart from the Howler.js and Three.js CDN loads) is in
   `uPhotoT / uSlideDur / uKenSeed` driving the auto-pan. The render loop
   binds image textures to `TEXTURE1 / TEXTURE2` and restores `TEXTURE0` for
   the spectrum sampler so the other shaders keep working unchanged.
-- Track Blobs are re-fetched from IndexedDB at play time before each Howl is
-  created, because Safari/WebKit invalidates IDB-backed `Blob` references
-  across page loads.
 - Loading the page with `?debug=1` enables verbose `[audio]` console logging
-  (AudioContext state changes, recovery, rebuilds); it is silent otherwise.
+  for playback and analysis; it is silent otherwise.
 
 ## Credits
 
-- [Howler.js](https://howlerjs.com/) — MIT.
 - [Three.js](https://threejs.org/) — MIT.
 - [Star Nest](https://www.shadertoy.com/view/XlfGRj) by Pablo Román Andrioli
   ("Kali") — MIT.

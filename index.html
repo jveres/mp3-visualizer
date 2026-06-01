@@ -524,9 +524,6 @@
 
   <input type="file" id="fileInput" accept="audio/mpeg,audio/mp3,.mp3" multiple style="display:none" />
 
-  <!-- Howler.js handles AudioContext lifecycle, mobile/iOS unlock, and tab
-       interruption recovery so we don't have to maintain ad-hoc patches. -->
-  <script src="https://cdn.jsdelivr.net/npm/howler@2.2.4/dist/howler.min.js" crossorigin="anonymous"></script>
   <input type="file" id="imgInput" accept="image/*" multiple webkitdirectory style="display:none" />
 
   <div class="drop-overlay" id="drop">
@@ -1535,13 +1532,18 @@ async function initTrails(){
       applyPalette(palettePhase);
 
       const an = Player.analyser;
+      let N = 0;
       if (an){
         if (!freqData || freqData.length !== an.frequencyBinCount){
           freqData = new Uint8Array(an.frequencyBinCount);
         }
         an.getByteFrequencyData(freqData);
-        const N = freqData.length;
+        N = freqData.length;
+      } else if (freqData && freqData.length) {
+        N = freqData.length;
+      }
 
+      if (N) {
         // Bins only color the texture; one global rhythm envelope drives motion.
         const kAttack  = Math.min(1, dt * 18.0);
         const kRelease = Math.min(1, dt * 9.0);
@@ -1836,224 +1838,267 @@ window.addEventListener('resize', resize);
 resize();
 
 // ---------- Audio ----------
-// Backed by Howler.js, which handles AudioContext lifecycle, iOS / mobile
-// audio unlock, and recovery from cross-tab audio interruptions. We splice
-// our analyser into Howler's master output so the visualizer keeps working.
+// Audible playback stays on a native HTMLAudioElement. Web Audio is used only
+// for capture/offline analysis and is never connected to the output path.
 const Player = (() => {
-  let current = null;       // active Howl instance
-  let analyser = null;
-  let analyserHooked = false;
+  const audio = new Audio();
+  audio.preload = 'auto';
   let pendingSrc = 0;
+  let pendingUrl = null;
   let volume = 0.85;
-  let pendingUrl = null;    // object URL of the active Howl, revoked on unload
   let onPlay = null, onPause = null, onEnded = null;
-  // Set whenever Howler.ctx ever transitions to 'interrupted' or 'suspended'.
-  // On WebKit/Safari the context can come back to 'running' while its hardware
-  // output binding stays dead — i.e. UI says playing, speakers silent. Once we
-  // see the interrupt we fully rebuild the audio graph on the next loadBlob.
-  let needsRebuild = false;
 
-  function hookAnalyser(force) {
-    if (typeof Howler === 'undefined' || !Howler.ctx || !Howler.masterGain) return;
-    if (!analyser) {
-      analyser = Howler.ctx.createAnalyser();
-      analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.82;
-    }
-    // Idempotent: re-splicing during playback briefly disconnects masterGain
-    // from the graph and causes an audible click. Only re-wire when we've never
-    // hooked, or when an interruption may have torn down the connections.
-    if (analyserHooked && !force) return;
-    try { Howler.masterGain.disconnect(); } catch {}
-    try { analyser.disconnect(); } catch {}
-    Howler.masterGain.connect(analyser);
-    analyser.connect(Howler.ctx.destination);
-    analyserHooked = true;
-  }
+  audio.addEventListener('play', () => { if (onPlay) onPlay(); });
+  audio.addEventListener('pause', () => { if (onPause) onPause(); });
+  audio.addEventListener('ended', () => { if (onEnded) onEnded(); });
 
-  // Re-create the underlying AudioBufferSourceNode by seeking to the current
-  // position. After an interruption (other tab grabbed audio focus), Safari /
-  // WebKit can return ctx.state to 'running' yet the still-attached source
-  // plays silently. Re-seeking forces Howler to spawn a fresh BufferSource.
-  function nudgeSource() {
-    if (!current) return;
-    try {
-      if (!current.playing()) return;
-      const t = current.seek();
-      if (typeof t === 'number') current.seek(t);
-    } catch {}
-  }
-
-  function onCtxStateChange() {
-    if (!Howler || !Howler.ctx) return;
-    const s = Howler.ctx.state;
-    dlog('[audio] ctx statechange ->', s);
-    if (s === 'interrupted' || s === 'suspended' || s === 'closed') {
-      needsRebuild = true;
-      analyserHooked = false;  // connections likely torn down
-    }
-    if (s === 'running') {
-      // Force a re-hook only if an interruption was observed (otherwise
-      // re-splicing during normal playback causes an audible click).
-      hookAnalyser(needsRebuild);
-      if (needsRebuild) nudgeSource();
-    }
-  }
-
-  // Tear down Howler's AudioContext and rebuild it from scratch. After a
-  // WebKit audio-focus interruption the existing ctx (and any BufferSource
-  // attached to it) can be silently dead even though state() reads 'running'.
-  // Closing and recreating the ctx + masterGain is the only reliable recovery.
-  // Howler 2.2.x doesn't expose a re-runnable setup hook, so we build the
-  // replacement ctx + masterGain manually and assign them onto Howler — any
-  // subsequent `new Howl({html5:false})` will pick them up.
-  function rebuildContext() {
-    dlog('[audio] rebuildContext: starting');
-    unloadCurrent();
-    if (typeof Howler === 'undefined') return;
-    try { Howler.unload(); } catch {}
-    const oldCtx = Howler.ctx;
-    try { if (oldCtx && typeof oldCtx.close === 'function') oldCtx.close(); } catch {}
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) {
-      needsRebuild = false;
-      return;
-    }
-    const ctx = new AC();
-    const masterGain = ctx.createGain();
-    masterGain.gain.value = (typeof Howler !== 'undefined' && typeof Howler.volume === 'function')
-      ? Howler.volume() : volume;
-    masterGain.connect(ctx.destination);
-    Howler.ctx = ctx;
-    Howler.masterGain = masterGain;
-    Howler.usingWebAudio = true;
-    // We're typically called inside a user-gesture click handler. Kick the
-    // brand-new ctx to 'running' right away so the next Howl can play.
-    try { ctx.resume(); } catch {}
-    // Reset Howler's autoUnlocked flag so it re-runs gesture unlock on the new
-    // ctx if needed. Best-effort; property may not exist on every Howler build.
-    try { Howler.autoUnlock && (Howler._audioUnlocked = false); } catch {}
-    analyser = null;
-    analyserHooked = false;
-    hookAnalyser();
-    try { ctx.addEventListener('statechange', onCtxStateChange); } catch {}
-    ctx._mvStateBound = true;
-    needsRebuild = false;
-    dlog('[audio] rebuildContext: done, ctx.state =', ctx.state);
-  }
-
-  function unloadCurrent() {
-    if (current) {
-      try { current.off(); } catch {}
-      try { current.unload(); } catch {}
-      current = null;
-    }
+  function clearUrl() {
     if (pendingUrl) {
       try { URL.revokeObjectURL(pendingUrl); } catch {}
       pendingUrl = null;
     }
   }
 
+  function unloadCurrent() {
+    try { audio.pause(); } catch {}
+    audio.removeAttribute('src');
+    try { audio.load(); } catch {}
+    clearUrl();
+  }
+
   return {
-    ensure() { /* Howler initialises lazily on first sound; nothing to do */ },
-    get analyser() { return analyser; },
-    get duration()    { return current ? (current.duration() || 0) : 0; },
-    get currentTime() {
-      if (!current) return 0;
-      try { const v = current.seek(); return typeof v === 'number' ? v : 0; }
-      catch { return 0; }
-    },
-    get paused()      { return !current || !current.playing(); },
-    get hasBuffer()   { return !!current; },
-    get state()       { return (typeof Howler !== 'undefined' && Howler.ctx) ? Howler.ctx.state : 'none'; },
-    set onPlay(fn)    { onPlay  = fn; },
-    set onPause(fn)   { onPause = fn; },
-    set onEnded(fn)   { onEnded = fn; },
+    ensure() {},
+    get analyser() { return VisualAudioAnalysis.analyser; },
+    get element() { return audio; },
+    get duration() { return Number.isFinite(audio.duration) ? audio.duration : 0; },
+    get currentTime() { return Number.isFinite(audio.currentTime) ? audio.currentTime : 0; },
+    get paused() { return audio.paused; },
+    get hasBuffer() { return !!audio.currentSrc || !!audio.src; },
+    get state() { return 'html-audio'; },
+    set onPlay(fn) { onPlay = fn; },
+    set onPause(fn) { onPause = fn; },
+    set onEnded(fn) { onEnded = fn; },
 
     setVolume(v) {
-      volume = v;
-      if (typeof Howler !== 'undefined') Howler.volume(v);
+      volume = Math.max(0, Math.min(1, v));
+      audio.volume = volume;
     },
-    resumeCtx() {
-      if (typeof Howler === 'undefined') return;
-      if (Howler.ctx) { try { Howler.ctx.resume(); } catch {} }
-    },
-    // Call when returning to the tab after another tab held audio focus.
-    // Resumes the AudioContext, re-applies the analyser splice once running,
-    // and nudges the current Howl's BufferSource so it can't be left silently
-    // muted by a WebKit-style interruption.
-    recover() {
-      if (typeof Howler === 'undefined' || !Howler.ctx) return;
-      const ctx = Howler.ctx;
-      // Chrome/Firefox keep the ctx + graph alive across tab switches: in that
-      // case the only safe action is a no-op (resume on an already-running ctx
-      // is fine, but re-splicing the analyser or re-seeking the source would
-      // cause an audible click/glitch on every tab return). Only do the heavy
-      // recovery work if we actually saw the ctx leave 'running'.
-      if (ctx.state === 'running' && !needsRebuild) return;
-      try { ctx.resume(); } catch {}
-      const apply = () => { hookAnalyser(true); nudgeSource(); };
-      if (ctx.state === 'running') apply();
-      setTimeout(() => { if (ctx.state === 'running') apply(); }, 80);
-      setTimeout(() => { if (ctx.state === 'running') apply(); }, 300);
-    },
-    get needsRebuild() { return needsRebuild; },
-    markRebuild() { needsRebuild = true; },
-    hardResetSync() { unloadCurrent(); },  // Howler manages ctx itself
 
     loadBlob(blob) {
       const myId = ++pendingSrc;
-      // If we previously observed an interruption, rebuild the entire audio
-      // graph before creating a new Howl. The old ctx and masterGain may be
-      // silently dead even though state() now reads 'running'.
-      if (needsRebuild) rebuildContext();
       unloadCurrent();
       const url = URL.createObjectURL(blob);
       pendingUrl = url;
+      audio.src = url;
+      audio.volume = volume;
+      audio.load();
+      dlog('[audio] html load start');
       return new Promise((resolve) => {
-        const sound = new Howl({
-          src: [url],
-          format: ['mp3', 'mpeg'],
-          html5: false,        // Web Audio path so the analyser sees the signal
-          volume,
-          onload() {
-            if (myId !== pendingSrc) {
-              try { sound.unload(); } catch {}
-              try { URL.revokeObjectURL(url); } catch {}
-              return resolve(null);
-            }
-            current = sound;
-            hookAnalyser();
-            if (Howler.ctx && !Howler.ctx._mvStateBound) {
-              try { Howler.ctx.addEventListener('statechange', onCtxStateChange); } catch {}
-              Howler.ctx._mvStateBound = true;
-            }
-            resolve(sound.duration());
-          },
-          onloaderror(_id, err) {
-            console.warn('Howl load error', err);
-            try { URL.revokeObjectURL(url); } catch {}
-            if (pendingUrl === url) pendingUrl = null;
-            resolve(null);
-          },
-          onplay()  { if (onPlay)  onPlay();  },
-          onpause() { if (onPause) onPause(); },
-          onstop()  { if (onPause) onPause(); },
-          onend()   { if (onEnded) onEnded(); },
-        });
+        let settled = false;
+        const cleanup = () => {
+          audio.removeEventListener('loadedmetadata', done);
+          audio.removeEventListener('durationchange', done);
+          audio.removeEventListener('canplay', done);
+          audio.removeEventListener('error', fail);
+        };
+        const finish = (value) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(value);
+        };
+        const done = () => {
+          if (myId !== pendingSrc) return finish(null);
+          const d = Number.isFinite(audio.duration) ? audio.duration : 0;
+          dlog('[audio] html metadata duration =', d);
+          finish(d);
+        };
+        const fail = () => {
+          console.warn('HTML audio load error', audio.error);
+          finish(null);
+        };
+        audio.addEventListener('loadedmetadata', done);
+        audio.addEventListener('durationchange', done);
+        audio.addEventListener('canplay', done);
+        audio.addEventListener('error', fail);
+        if (Number.isFinite(audio.duration) && audio.duration > 0) done();
       });
     },
 
-    play()  { if (current) { try { current.play(); } catch (e) { console.warn(e); } } },
-    pause() { if (current) { try { current.pause(); } catch {} } },
-    togglePlay() { if (this.paused) this.play(); else this.pause(); },
-    seek(t) {
-      if (!current) return;
-      const d = current.duration();
-      const tgt = Math.max(0, Math.min((d || 0) - 0.05, t));
-      try { current.seek(tgt); } catch {}
+    play() {
+      if (!audio.src) return;
+      try {
+        const p = audio.play();
+        dlog('[audio] html play requested');
+        if (p && typeof p.catch === 'function') p.catch(e => console.warn('HTML audio play failed', e));
+      } catch (e) { console.warn(e); }
     },
-    stop() { unloadCurrent(); },
+    pause() { try { audio.pause(); } catch {} },
+    togglePlay() { if (audio.paused) this.play(); else this.pause(); },
+    seek(t) {
+      if (!audio.src) return;
+      const d = Number.isFinite(audio.duration) ? audio.duration : 0;
+      const maxT = d > 0 ? Math.max(0, d - 0.05) : Math.max(0, t);
+      try { audio.currentTime = Math.max(0, Math.min(maxT, t)); } catch {}
+    },
+    stop() {
+      unloadCurrent();
+      VisualAudioAnalysis.unload();
+    },
+  };
+})();
+
+const VISUAL_FFT_SIZE = 1024;
+
+const VisualAudioAnalysis = (() => {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let element = null;
+  let stream = null;
+  let ctx = null;
+  let source = null;
+  let analyser = null;
+  let mode = 'offline';
+  let retryTimer = 0;
+  let listenersInstalled = false;
+  let warned = false;
+
+  function capture(el) {
+    if (!el) return null;
+    if (typeof el.captureStream === 'function') return el.captureStream();
+    if (typeof el.mozCaptureStream === 'function') return el.mozCaptureStream();
+    return null;
+  }
+
+  function disconnectGraph() {
+    try { if (source) source.disconnect(); } catch {}
+    try { if (analyser) analyser.disconnect(); } catch {}
+    source = null;
+    analyser = null;
+  }
+
+  function clearRetry() {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = 0;
+    }
+  }
+
+  function scheduleRetry() {
+    if (retryTimer || !element) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = 0;
+      connect();
+    }, 80);
+  }
+
+  function ensureContext() {
+    if (!AC) return null;
+    if (!ctx || ctx.state === 'closed') ctx = new AC();
+    return ctx;
+  }
+
+  function resume() {
+    if (ctx && ctx.state === 'suspended') {
+      const p = ctx.resume();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    }
+  }
+
+  function makeAnalyser(c) {
+    const an = c.createAnalyser();
+    an.fftSize = VISUAL_FFT_SIZE;
+    an.smoothingTimeConstant = 0.55;
+    return an;
+  }
+
+  function connect() {
+    if (analyser) {
+      resume();
+      return true;
+    }
+    if (!element) return false;
+    const nextStream = stream || capture(element);
+    if (!nextStream) {
+      mode = 'offline';
+      if (!warned && DEBUG) {
+        warned = true;
+        dlog('[audio] visual analysis: captureStream unavailable; using offline analysis');
+      }
+      return false;
+    }
+    stream = nextStream;
+    if (!stream.getAudioTracks || stream.getAudioTracks().length === 0) {
+      mode = 'pending';
+      scheduleRetry();
+      return false;
+    }
+    const c = ensureContext();
+    if (!c) {
+      mode = 'offline';
+      return false;
+    }
+    try {
+      const an = makeAnalyser(c);
+      source = c.createMediaStreamSource(stream);
+      source.connect(an);
+      analyser = an;
+      mode = 'capture-live';
+      clearRetry();
+      resume();
+      dlog('[audio] visual analysis: live capture ready');
+      return true;
+    } catch (e) {
+      disconnectGraph();
+      mode = 'offline';
+      if (DEBUG) console.warn('[audio] visual analysis capture failed', e);
+      return false;
+    }
+  }
+
+  function installListeners(el) {
+    if (listenersInstalled || !el) return;
+    const retry = () => {
+      if (!analyser) connect();
+      else resume();
+    };
+    el.addEventListener('loadedmetadata', retry);
+    el.addEventListener('durationchange', retry);
+    el.addEventListener('canplay', retry);
+    el.addEventListener('play', retry);
+    el.addEventListener('playing', retry);
+    listenersInstalled = true;
+  }
+
+  function unload() {
+    clearRetry();
+    disconnectGraph();
+    stream = null;
+    mode = 'offline';
+  }
+
+  return {
+    get analyser() {
+      if (analyser && ctx && ctx.state === 'closed') disconnectGraph();
+      return analyser;
+    },
+    get mode() { return mode; },
+    attach(el, reset = false) {
+      if (!el) return false;
+      if (element !== el) {
+        element = el;
+        installListeners(el);
+        reset = true;
+      }
+      if (reset) {
+        clearRetry();
+        disconnectGraph();
+        stream = null;
+        mode = 'offline';
+      }
+      return connect();
+    },
+    unload,
+    resume,
   };
 })();
 
@@ -2452,37 +2497,59 @@ function parseId3v1(buf) {
   return { title, artist, album, year, comment, track, genre };
 }
 
+function parseMpegFrameHeaderAt(buf, i) {
+  if (i < 0 || i + 4 > buf.length) return null;
+  if (buf[i] !== 0xFF || (buf[i+1] & 0xE0) !== 0xE0) return null;
+  const b1 = buf[i+1], b2 = buf[i+2], b3 = buf[i+3];
+  const versionId = (b1 >> 3) & 0x03; // 0=v2.5, 2=v2, 3=v1
+  const layer = (b1 >> 1) & 0x03;     // 1=Layer III
+  const bitrateIdx = (b2 >> 4) & 0x0F;
+  const srIdx = (b2 >> 2) & 0x03;
+  const padding = (b2 >> 1) & 0x01;
+  const channelMode = (b3 >> 6) & 0x03;
+  if (versionId === 1 || layer === 0 || bitrateIdx === 0 || bitrateIdx === 15 || srIdx === 3) return null;
+  const bitrateTable = versionId === 3 ? MP3_BITRATES_V1L3 : MP3_BITRATES_V2L3;
+  const bitrate = bitrateTable[bitrateIdx] * 1000;
+  const sampleRate = MP3_SAMPLERATES[versionId][srIdx];
+  if (!bitrate || !sampleRate) return null;
+  const versionName = versionId === 3 ? 'MPEG-1' : versionId === 2 ? 'MPEG-2' : 'MPEG-2.5';
+  const layerName = layer === 1 ? 'Layer III' : layer === 2 ? 'Layer II' : 'Layer I';
+  return {
+    offset: i,
+    version: versionName,
+    layer: layerName,
+    bitrate,
+    sampleRate,
+    channelMode: MP3_CHANNEL_MODES[channelMode],
+    padding,
+    mpegVersionId: versionId,
+    channels: channelMode === 3 ? 1 : 2,
+  };
+}
+
 function parseMpegFrame(buf, start) {
   for (let i = start; i < buf.length - 4; i++) {
-    if (buf[i] === 0xFF && (buf[i+1] & 0xE0) === 0xE0) {
-      const b1 = buf[i+1], b2 = buf[i+2], b3 = buf[i+3];
-      const versionId = (b1 >> 3) & 0x03; // 0=v2.5, 2=v2, 3=v1
-      const layer = (b1 >> 1) & 0x03;     // 1=Layer III
-      const bitrateIdx = (b2 >> 4) & 0x0F;
-      const srIdx = (b2 >> 2) & 0x03;
-      const padding = (b2 >> 1) & 0x01;
-      const channelMode = (b3 >> 6) & 0x03;
-      if (versionId === 1 || layer === 0 || bitrateIdx === 0 || bitrateIdx === 15 || srIdx === 3) continue;
-      const bitrateTable = versionId === 3 ? MP3_BITRATES_V1L3 : MP3_BITRATES_V2L3;
-      const bitrate = bitrateTable[bitrateIdx] * 1000;
-      const sampleRate = MP3_SAMPLERATES[versionId][srIdx];
-      if (!bitrate || !sampleRate) continue;
-      const versionName = versionId === 3 ? 'MPEG-1' : versionId === 2 ? 'MPEG-2' : 'MPEG-2.5';
-      const layerName = layer === 1 ? 'Layer III' : layer === 2 ? 'Layer II' : 'Layer I';
-      return {
-        offset: i,
-        version: versionName,
-        layer: layerName,
-        bitrate,
-        sampleRate,
-        channelMode: MP3_CHANNEL_MODES[channelMode],
-        padding,
-        mpegVersionId: versionId,
-        channels: channelMode === 3 ? 1 : 2,
-      };
-    }
+    const frame = parseMpegFrameHeaderAt(buf, i);
+    if (frame) return frame;
   }
   return null;
+}
+
+function mpegSamplesPerFrame(frame) {
+  if (!frame) return 1152;
+  if (frame.layer === 'Layer I') return 384;
+  return frame.mpegVersionId === 3 ? 1152 : 576;
+}
+
+function mpegFrameByteLength(frame) {
+  if (!frame || !frame.bitrate || !frame.sampleRate) return 0;
+  if (frame.layer === 'Layer I') {
+    return Math.floor(((12 * frame.bitrate / frame.sampleRate) + frame.padding) * 4);
+  }
+  if (frame.layer === 'Layer III' && frame.mpegVersionId !== 3) {
+    return Math.floor((72 * frame.bitrate / frame.sampleRate) + frame.padding);
+  }
+  return Math.floor((144 * frame.bitrate / frame.sampleRate) + frame.padding);
 }
 
 function parseXingLame(buf, frame) {
@@ -2667,17 +2734,29 @@ function lowerBound(arr, value) {
 
 function decodeAudioBuffer(blob) {
   const AC = window.AudioContext || window.webkitAudioContext;
-  const ctx = (typeof Howler !== 'undefined' && Howler.ctx) ? Howler.ctx : (AC ? new AC() : null);
+  const OfflineAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const ctx = OfflineAC ? new OfflineAC(1, 1, 44100) : (AC ? new AC() : null);
   if (!ctx) return Promise.resolve(null);
   return blob.arrayBuffer().then(buf => new Promise((resolve) => {
     const copy = buf.slice(0);
-    const done = (audioBuffer) => resolve(audioBuffer || null);
-    const fail = () => resolve(null);
+    let settled = false;
+    const finish = (audioBuffer) => {
+      if (settled) return;
+      settled = true;
+      try { if (ctx.close) ctx.close(); } catch {}
+      resolve(audioBuffer || null);
+    };
+    const done = (audioBuffer) => {
+      finish(audioBuffer);
+    };
+    const fail = () => {
+      finish(null);
+    };
     try {
       const p = ctx.decodeAudioData(copy, done, fail);
       if (p && typeof p.then === 'function') p.then(done, fail);
     } catch {
-      resolve(null);
+      fail();
     }
   }));
 }
@@ -2789,12 +2868,391 @@ function estimateBeatMap(audioBuffer) {
   return beats.length > 4 ? { beats, period, confidence } : null;
 }
 
-function ensureBeatMap(track, blob) {
-  if (track.beatMap || track.beatMapPromise) return;
-  track.beatMapPromise = decodeAudioBuffer(blob)
-    .then(estimateBeatMap)
-    .then(map => { track.beatMap = map; return map; })
+const ANALYSIS_FPS = 30;
+const ANALYSIS_STRIDE = 9;
+const ANALYSIS_SPEC_BINS = 256;
+
+function fillAnalysisSpectrum(out, bass, mid, hi, level, flux, time) {
+  const tick = Math.floor(time * 24);
+  const fadeIn = Math.min(1, Math.max(0, time * 2.8));
+  for (let i = 0; i < out.length; i++) {
+    const x = i / Math.max(1, out.length - 1);
+    const low = bass * Math.exp(-x * 13.5) * 0.72;
+    const midBand = mid * Math.exp(-Math.pow((x - 0.20) / 0.13, 2)) * 0.46;
+    const highBand = hi * Math.exp(-Math.pow((x - 0.58) / 0.25, 2)) * (0.16 + x * 0.24);
+    const hashA = Math.sin((i + 1) * 12.9898 + tick * 78.233) * 43758.5453;
+    const hashB = Math.sin((i + 17) * 4.177 + Math.floor(time * 9) * 19.19) * 24634.6345;
+    const grainA = hashA - Math.floor(hashA);
+    const grainB = hashB - Math.floor(hashB);
+    const comb = 0.34 + 0.52 * Math.pow(grainA, 2.2) + 0.14 * Math.sin(i * 0.39 + time * 2.1 + flux * 4.0);
+    const transient = flux * Math.exp(-x * 6.0) * (0.18 + 0.30 * grainB);
+    const v = (low + midBand + highBand + transient + level * 0.012) * Math.max(0, comb) * fadeIn;
+    out[i] = Math.max(0, Math.min(185, Math.round(v * 255)));
+  }
+}
+
+function hashString01(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return ((h >>> 0) % 10000) / 10000;
+}
+
+function makeAnalysisObject(frameCount, duration, bands, beatMap = null) {
+  return {
+    fps: ANALYSIS_FPS,
+    frameCount,
+    duration,
+    bands,
+    spectra: null,
+    beatMap,
+    sample(time, outSpec) {
+      const x = Math.max(0, Math.min(frameCount - 1, time * this.fps));
+      const i0 = Math.floor(x);
+      const i1 = Math.min(frameCount - 1, i0 + 1);
+      const k = x - i0;
+      const o0 = i0 * ANALYSIS_STRIDE;
+      const o1 = i1 * ANALYSIS_STRIDE;
+      const lerp = (slot) => bands[o0 + slot] + (bands[o1 + slot] - bands[o0 + slot]) * k;
+      const fade = this.fadeIn ? Math.min(1, Math.max(0, time * 2.8)) : 1;
+      const bass = lerp(0) * fade;
+      const mid = lerp(1) * fade;
+      const hi = lerp(2) * fade;
+      const level = lerp(3) * fade;
+      const rms = lerp(4) * fade;
+      const flux = lerp(5) * fade;
+      const melodicPeak = lerp(6) * fade;
+      const melodicEnergy = lerp(7) * fade;
+      const melodicContrast = lerp(8) * fade;
+      if (outSpec) {
+        const spectra = this.spectra;
+        const bins = ANALYSIS_SPEC_BINS;
+        const so0 = i0 * bins;
+        const so1 = i1 * bins;
+        if (spectra && spectra.length >= so1 + bins) {
+          for (let b = 0; b < bins; b++) {
+            outSpec[b] = spectra[so0 + b] + (spectra[so1 + b] - spectra[so0 + b]) * k;
+          }
+        } else {
+          fillAnalysisSpectrum(outSpec, bass, mid, hi, level, flux, time);
+        }
+      }
+      return { bass, mid, hi, level, waveRms: rms, spectralFlux: flux, melodicPeak, melodicEnergy, melodicContrast };
+    }
+  };
+}
+
+function makeProceduralPreviewAnalysis(track) {
+  const seed = hashString01(track && track.name ? track.name : '');
+  const phase = seed * Math.PI * 2;
+  const beatHz = 1.45 + seed * 0.75;
+  return {
+    fps: ANALYSIS_FPS,
+    frameCount: 0,
+    duration: track && track.dur ? track.dur : 0,
+    beatMap: null,
+    preview: true,
+    procedural: true,
+    sample(time, outSpec) {
+      const intro = Math.min(1, Math.max(0, time * 1.7));
+      const p = time * beatHz * Math.PI * 2 - Math.PI * 0.5;
+      const beat = Math.pow(Math.max(0, Math.sin(p)), 5.0);
+      const offbeat = Math.pow(Math.max(0, Math.sin(p * 2.0 + 1.7)), 7.0);
+      const flow = 0.5 + 0.5 * Math.sin(time * (0.52 + seed * 0.2) + phase * 0.37);
+      const flicker = 0.5 + 0.5 * Math.sin(time * (4.8 + seed) + phase * 1.9);
+      const bass = Math.min(1, (0.025 + beat * 0.16 + flow * 0.035) * intro);
+      const mid = Math.min(1, (0.030 + offbeat * 0.10 + flow * 0.050) * intro);
+      const hi = Math.min(1, (0.018 + flicker * 0.035 + offbeat * 0.045) * intro);
+      const level = Math.min(1, ((bass + mid + hi) / 3 + beat * 0.025) * intro);
+      const flux = Math.min(1, (Math.pow(Math.max(0, Math.cos(p)), 4.0) * 0.10 + offbeat * 0.035) * intro);
+      const melodicEnergy = Math.min(1, mid * 0.82 + hi * 0.18);
+      const melodicPeak = Math.min(1, Math.max(mid, hi * 1.15));
+      const melodicContrast = Math.max(0, melodicPeak - melodicEnergy * 1.18);
+      if (outSpec) fillAnalysisSpectrum(outSpec, bass, mid, hi, level, flux, time);
+      return { bass, mid, hi, level, waveRms: level, spectralFlux: flux, melodicPeak, melodicEnergy, melodicContrast };
+    }
+  };
+}
+
+function normalizeAnalysisBands(rawBands, frameCount, duration, beatMap = null) {
+  let maxBass = 1e-6, maxMid = 1e-6, maxHi = 1e-6, maxRms = 1e-6;
+  for (let f = 0; f < frameCount; f++) {
+    const o = f * ANALYSIS_STRIDE;
+    maxBass = Math.max(maxBass, rawBands[o]);
+    maxMid = Math.max(maxMid, rawBands[o + 1]);
+    maxHi = Math.max(maxHi, rawBands[o + 2]);
+    maxRms = Math.max(maxRms, rawBands[o + 4]);
+  }
+
+  const bands = new Float32Array(frameCount * ANALYSIS_STRIDE);
+  let prevBass = 0, prevMid = 0, prevHi = 0, prevLevel = 0;
+  for (let f = 0; f < frameCount; f++) {
+    const o = f * ANALYSIS_STRIDE;
+    const bass = Math.min(0.58, Math.pow(rawBands[o] / (maxBass * 1.08), 0.94) * 0.48);
+    const mid = Math.min(0.50, Math.pow(rawBands[o + 1] / (maxMid * 1.12), 0.96) * 0.42);
+    const hi = Math.min(0.42, Math.pow(rawBands[o + 2] / (maxHi * 1.18), 0.98) * 0.34);
+    const rms = Math.min(0.56, Math.pow(rawBands[o + 4] / (maxRms * 1.10), 0.92) * 0.46);
+    const level = Math.min(0.55, rms * 0.34 + (bass + mid + hi) / 3 * 0.58);
+    const spectralFlux = Math.min(1,
+      Math.max(0, level - prevLevel) * 1.15 +
+      Math.max(0, bass - prevBass) * 0.65 +
+      Math.max(0, mid - prevMid) * 0.36 +
+      Math.max(0, hi - prevHi) * 0.22
+    );
+    const melodicEnergy = Math.min(1, mid * 0.72 + hi * 0.22 + bass * 0.06);
+    const melodicPeak = Math.min(1, Math.max(mid, hi * 0.85));
+    bands[o] = bass;
+    bands[o + 1] = mid;
+    bands[o + 2] = hi;
+    bands[o + 3] = level;
+    bands[o + 4] = rms;
+    bands[o + 5] = spectralFlux;
+    bands[o + 6] = melodicPeak;
+    bands[o + 7] = melodicEnergy;
+    bands[o + 8] = Math.max(0, melodicPeak - melodicEnergy * 1.18);
+    prevBass = bass;
+    prevMid = mid;
+    prevHi = hi;
+    prevLevel = level;
+  }
+  const analysis = makeAnalysisObject(frameCount, duration, bands, beatMap);
+  analysis.fadeIn = true;
+  return analysis;
+}
+
+function measureByteFrame(bytes, start, end) {
+  const len = Math.max(0, end - start);
+  if (!len) return [0, 0, 0, 0];
+  const step = Math.max(1, Math.floor(len / 96));
+  let low = 0, prev = 0, count = 0;
+  let lowSum = 0, midSum = 0, hiSum = 0, rmsSum = 0;
+  for (let p = start; p < end; p += step) {
+    const x = (bytes[p] - 128) / 128;
+    low += (x - low) * 0.10;
+    const midResidual = x - low;
+    const diff = x - prev;
+    lowSum += low * low;
+    midSum += midResidual * midResidual;
+    hiSum += diff * diff;
+    rmsSum += x * x;
+    prev = x;
+    count++;
+  }
+  const complexity = Math.min(1, Math.log1p(len) / 7.0);
+  return [
+    Math.sqrt(lowSum / Math.max(1, count)) * (0.85 + complexity * 0.18),
+    Math.sqrt(midSum / Math.max(1, count)) * (0.78 + complexity * 0.24),
+    Math.sqrt(hiSum / Math.max(1, count)) * (0.68 + complexity * 0.18),
+    Math.sqrt(rmsSum / Math.max(1, count)),
+  ];
+}
+
+function fillCompressedSpectrum(out, offset, bytes, start, end, bass, mid, hi, level, flux, time) {
+  const len = Math.max(0, end - start);
+  if (!len) {
+    const tmp = out.subarray(offset, offset + ANALYSIS_SPEC_BINS);
+    fillAnalysisSpectrum(tmp, bass, mid, hi, level, flux, time);
+    return;
+  }
+  const intro = Math.min(1, Math.max(0, time * 2.8));
+  for (let b = 0; b < ANALYSIS_SPEC_BINS; b++) {
+    const x = b / Math.max(1, ANALYSIS_SPEC_BINS - 1);
+    const base = Math.floor(Math.pow(x, 1.45) * Math.max(0, len - 1));
+    const p0 = start + Math.min(len - 1, base);
+    const p1 = start + Math.min(len - 1, base + 1);
+    const p2 = start + Math.min(len - 1, base + 5);
+    const raw0 = Math.abs((bytes[p0] || 128) - 128) / 128;
+    const raw1 = Math.abs((bytes[p1] || 128) - 128) / 128;
+    const raw2 = Math.abs((bytes[p2] || 128) - 128) / 128;
+    const local = Math.max(raw0, raw1 * 0.85, raw2 * 0.65);
+    const low = bass * Math.exp(-x * 12.0) * 0.70;
+    const midBand = mid * Math.exp(-Math.pow((x - 0.22) / 0.14, 2)) * 0.44;
+    const highBand = hi * Math.exp(-Math.pow((x - 0.58) / 0.26, 2)) * (0.14 + x * 0.22);
+    const transient = flux * Math.exp(-x * 5.5) * 0.18;
+    const shimmer = 0.30 + local * 0.78;
+    const v = (low + midBand + highBand + transient + level * 0.010) * shimmer * intro;
+    out[offset + b] = Math.max(0, Math.min(185, Math.round(v * 255)));
+  }
+}
+
+function makeCompressedTrackAnalysis(bytes, fallbackDuration = 0) {
+  if (!bytes || bytes.length < 8) return null;
+  let start = 0;
+  try {
+    const id3 = parseId3v2(bytes.subarray(0, Math.min(bytes.length, 256 * 1024)));
+    if (id3) start = id3.size;
+  } catch {}
+  let frame = parseMpegFrame(bytes, start);
+  if (!frame) return null;
+
+  const samples = [];
+  let pos = frame.offset;
+  let sampleCursor = 0;
+  let sampleRate = frame.sampleRate;
+  let guard = 0;
+  while (pos + 4 < bytes.length && guard++ < 70000) {
+    let fr = parseMpegFrameHeaderAt(bytes, pos);
+    if (!fr) {
+      const next = parseMpegFrame(bytes, pos + 1);
+      if (!next) break;
+      fr = next;
+      pos = fr.offset;
+    }
+    const frameBytes = mpegFrameByteLength(fr);
+    if (!frameBytes || frameBytes < 8) {
+      pos++;
+      continue;
+    }
+    const end = Math.min(bytes.length, pos + frameBytes);
+    const sideInfoLen = fr.layer === 'Layer III'
+      ? (fr.mpegVersionId === 3 ? (fr.channels === 1 ? 17 : 32) : (fr.channels === 1 ? 9 : 17))
+      : 0;
+    const payloadStart = Math.min(end, pos + 4 + sideInfoLen);
+    const measured = measureByteFrame(bytes, payloadStart, end);
+    samples.push({
+      time: sampleCursor / fr.sampleRate,
+      start: payloadStart,
+      end,
+      bass: measured[0],
+      mid: measured[1],
+      hi: measured[2],
+      rms: measured[3],
+    });
+    sampleCursor += mpegSamplesPerFrame(fr);
+    sampleRate = fr.sampleRate;
+    pos += frameBytes;
+  }
+  if (samples.length < 4) return null;
+
+  const duration = Math.max(fallbackDuration || 0, sampleCursor / Math.max(1, sampleRate));
+  const frameCount = Math.max(1, Math.ceil(duration * ANALYSIS_FPS) + 1);
+  const rawBands = new Float32Array(frameCount * ANALYSIS_STRIDE);
+  let si = 0;
+  for (let f = 0; f < frameCount; f++) {
+    const time = f / ANALYSIS_FPS;
+    while (si + 1 < samples.length && samples[si + 1].time <= time) si++;
+    const a = samples[si];
+    const b = samples[Math.min(samples.length - 1, si + 1)];
+    const span = Math.max(0.001, b.time - a.time);
+    const k = Math.max(0, Math.min(1, (time - a.time) / span));
+    const o = f * ANALYSIS_STRIDE;
+    rawBands[o] = a.bass + (b.bass - a.bass) * k;
+    rawBands[o + 1] = a.mid + (b.mid - a.mid) * k;
+    rawBands[o + 2] = a.hi + (b.hi - a.hi) * k;
+    rawBands[o + 4] = a.rms + (b.rms - a.rms) * k;
+  }
+  const analysis = normalizeAnalysisBands(rawBands, frameCount, duration);
+  const spectra = new Uint8Array(frameCount * ANALYSIS_SPEC_BINS);
+  si = 0;
+  for (let f = 0; f < frameCount; f++) {
+    const time = f / ANALYSIS_FPS;
+    while (si + 1 < samples.length && samples[si + 1].time <= time) si++;
+    const sample = samples[si];
+    const o = f * ANALYSIS_STRIDE;
+    fillCompressedSpectrum(
+      spectra,
+      f * ANALYSIS_SPEC_BINS,
+      bytes,
+      sample.start,
+      sample.end,
+      analysis.bands[o],
+      analysis.bands[o + 1],
+      analysis.bands[o + 2],
+      analysis.bands[o + 3],
+      analysis.bands[o + 5],
+      time
+    );
+  }
+  analysis.spectra = spectra;
+  analysis.preview = true;
+  analysis.compressed = true;
+  return analysis;
+}
+
+function makeTrackAnalysis(audioBuffer) {
+  if (!audioBuffer || !audioBuffer.length || !audioBuffer.sampleRate) return null;
+  const sr = audioBuffer.sampleRate;
+  const ch0 = audioBuffer.getChannelData(0);
+  const ch1 = audioBuffer.numberOfChannels > 1 ? audioBuffer.getChannelData(1) : null;
+  const duration = audioBuffer.duration || (audioBuffer.length / sr);
+  const frameCount = Math.max(1, Math.ceil(duration * ANALYSIS_FPS) + 1);
+  const rawBands = new Float32Array(frameCount * ANALYSIS_STRIDE);
+  const windowSize = Math.max(512, Math.min(4096, Math.round(sr * 0.046)));
+  const half = Math.floor(windowSize / 2);
+  const step = Math.max(1, Math.floor(windowSize / 256));
+
+  for (let f = 0; f < frameCount; f++) {
+    const center = Math.min(audioBuffer.length - 1, Math.max(0, Math.round((f / ANALYSIS_FPS) * sr)));
+    let low = 0, prev = 0, count = 0;
+    let lowSum = 0, midSum = 0, hiSum = 0, rmsSum = 0;
+    for (let j = -half; j < half; j += step) {
+      const idx = Math.max(0, Math.min(audioBuffer.length - 1, center + j));
+      let x = ch0[idx] || 0;
+      if (ch1) x = (x + (ch1[idx] || 0)) * 0.5;
+      low += (x - low) * 0.075;
+      const midResidual = x - low;
+      const diff = x - prev;
+      lowSum += low * low;
+      midSum += midResidual * midResidual;
+      hiSum += diff * diff;
+      rmsSum += x * x;
+      prev = x;
+      count++;
+    }
+    const o = f * ANALYSIS_STRIDE;
+    const bassRaw = Math.sqrt(lowSum / Math.max(1, count));
+    const midRaw = Math.sqrt(midSum / Math.max(1, count));
+    const hiRaw = Math.sqrt(hiSum / Math.max(1, count));
+    const rmsRaw = Math.sqrt(rmsSum / Math.max(1, count));
+    rawBands[o] = bassRaw;
+    rawBands[o + 1] = midRaw;
+    rawBands[o + 2] = hiRaw;
+    rawBands[o + 4] = rmsRaw;
+  }
+
+  return normalizeAnalysisBands(rawBands, frameCount, duration, estimateBeatMap(audioBuffer));
+}
+
+function ensurePreviewAnalysis(track, blob) {
+  if (!track.previewAnalysis) track.previewAnalysis = makeProceduralPreviewAnalysis(track);
+  if (track.previewPromise || track.analysis) return track.previewPromise || Promise.resolve(track.previewAnalysis);
+  track.previewPromise = blob.arrayBuffer()
+    .then(buf => makeCompressedTrackAnalysis(new Uint8Array(buf), track.dur))
+    .then(analysis => {
+      if (analysis) {
+        track.previewAnalysis = analysis;
+        dlog('[audio] preview analysis ready:', track.name, `${analysis.frameCount} frames`);
+      }
+      return analysis || track.previewAnalysis;
+    })
+    .catch(() => track.previewAnalysis || null);
+  return track.previewPromise;
+}
+
+function ensureTrackAnalysis(track, blob) {
+  if (track.analysis || track.analysisPromise) return track.analysisPromise || Promise.resolve(track.analysis);
+  track.analysisPromise = decodeAudioBuffer(blob)
+    .then(makeTrackAnalysis)
+    .then(analysis => {
+      track.analysis = analysis;
+      track.beatMap = analysis && analysis.beatMap;
+      dlog('[audio] analysis ready:', track.name, analysis ? `${analysis.frameCount} frames` : 'none');
+      return analysis;
+    })
     .catch(() => null);
+  return track.analysisPromise;
+}
+
+function ensureBeatMap(track, blob) {
+  return ensureTrackAnalysis(track, blob);
+}
+
+function visualAnalysisForTrack(track) {
+  if (!track) return null;
+  if (track.previewAnalysis && !track.previewAnalysis.procedural) return track.previewAnalysis;
+  return track.analysis || track.previewAnalysis || null;
 }
 
 function activeBeatMap() {
@@ -2884,11 +3342,13 @@ function removeTrack(i) {
   persistMeta();
 }
 
-async function playIndex(i) {
+async function playIndex(i, opts = {}) {
   if (i < 0 || i >= tracks.length) return;
   const wasDifferent = current !== i;
   current = i;
   const t = tracks[i];
+  const resumeAt = Number.isFinite(opts.resumeAt) ? Math.max(0, opts.resumeAt) : 0;
+  let blob = t.blob;
   if (wasDifferent) {
     beatMapTrack = -1;
     beatMapCursor = 0;
@@ -2897,13 +3357,6 @@ async function playIndex(i) {
     beatEnv = 0;
     beatConfidence = 0;
   }
-  // If a previous ctx got wedged (another tab grabbed audio focus, OS
-  // interrupted us), recreate it synchronously inside the click stack so
-  // the immediately-following resumeCtx can lift it to 'running'.
-  if (Player.state === 'interrupted' || Player.state === 'closed') {
-    Player.hardResetSync();
-  }
-  Player.resumeCtx();
   nowEl.textContent = t.name;
   if (autoSwitchFx && wasDifferent) {
     let next = curEffect;
@@ -2913,23 +3366,14 @@ async function playIndex(i) {
     useEffect(next);
   }
   renderPlaylist();
-  // re-fetch a fresh blob from IDB before decoding. Safari's IDB-backed Blob
-  // references can go stale across page loads (WebKitBlobResource error 1 →
-  // decodeAudioData NotFoundError); a fresh read from the store always works.
-  let blob = t.blob;
-  if (t.id != null) {
-    try {
-      const fresh = await idb.get(t.id);
-      if (fresh && fresh.blob) {
-        blob = fresh.blob;
-        t.blob = fresh.blob;
-      }
-    } catch (e) { /* fall back to in-memory blob */ }
-  }
+  const loadPromise = Player.loadBlob(blob);
+  VisualAudioAnalysis.attach(Player.element, true);
+  ensurePreviewAnalysis(t, blob);
+  primeTrackReactivity();
+  Player.play();
   if (current !== i) return;
-  ensureBeatMap(t, blob);
-  // decode + play asynchronously (the only reliable way for VBR MP3 blobs)
-  const dur = await Player.loadBlob(blob);
+  ensureTrackAnalysis(t, blob);
+  const dur = await loadPromise;
   if (current !== i) return; // user switched while decoding
   if (dur != null && dur > 0 && (!t.dur || Math.abs(t.dur - dur) > 0.5)) {
     t.dur = dur;
@@ -2937,24 +3381,16 @@ async function playIndex(i) {
     renderPlaylist();
   }
   durEl.textContent = fmtTime(Player.duration);
-  primeTrackReactivity();
-  Player.play();
+  if (resumeAt > 0) Player.seek(resumeAt);
 }
 
 function togglePlay() {
-  dlog('[audio] togglePlay: current=', current, 'state=', Player.state, 'needsRebuild=', Player.needsRebuild, 'paused=', Player.paused, 'hasBuffer=', Player.hasBuffer);
+  const state = Player.state;
+  dlog('[audio] togglePlay: current=', current, 'state=', state, 'analysis=', VisualAudioAnalysis.mode, 'paused=', Player.paused, 'hasBuffer=', Player.hasBuffer);
   if (current === -1) {
     if (tracks.length) playIndex(0);
     return;
   }
-  // A previous tab interruption flagged the AudioContext as dead. We're inside
-  // a click handler — a real user gesture — so reloading via playIndex now
-  // routes through rebuildContext() and the fresh ctx can be resumed.
-  if (Player.needsRebuild || Player.state === 'interrupted' || Player.state === 'closed') {
-    playIndex(current);
-    return;
-  }
-  Player.resumeCtx();
   if (!Player.hasBuffer) {
     playIndex(current);
     return;
@@ -2967,7 +3403,11 @@ playBtn.addEventListener('click', togglePlay);
 prevBtn.addEventListener('click', () => { const n = pickNext(-1); if (n >= 0) playIndex(n); });
 nextBtn.addEventListener('click', () => { const n = pickNext( 1); if (n >= 0) playIndex(n); });
 
-Player.onPlay  = () => { playIcon.innerHTML = '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>'; };
+Player.onPlay  = () => {
+  VisualAudioAnalysis.attach(Player.element);
+  VisualAudioAnalysis.resume();
+  playIcon.innerHTML = '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>';
+};
 Player.onPause = () => { playIcon.innerHTML = '<path d="M8 5v14l11-7L8 5z"/>'; };
 Player.onEnded = () => {
   const n = pickNext(1);
@@ -3201,27 +3641,9 @@ function syncFsIcon() {
 document.addEventListener('fullscreenchange', syncFsIcon);
 document.addEventListener('webkitfullscreenchange', syncFsIcon);
 
-// Resume the AudioContext when the tab regains focus, and — if we ever
-// observed an interruption ('interrupted' / 'suspended' / 'closed') — fully
-// rebuild Howler's context and reload the current track. On WebKit the
-// context can return to 'running' with a dead hardware output binding, so
-// resume() + seek-nudging the existing source isn't enough; the audio graph
-// must be torn down and recreated. Reloading the current track via
-// playIndex(current) routes through Player.loadBlob which performs the
-// rebuild before instantiating the new Howl.
 function onTabVisible() {
-  dlog('[audio] tab visible: ctx.state =', Player.state, 'needsRebuild =', Player.needsRebuild, 'paused =', Player.paused);
-  // Soft path: try to nudge the existing graph back to life (cheap; works
-  // when the browser kept the ctx and hardware binding alive).
-  try { Player.recover(); } catch {}
-  // Hard path: if an interruption was observed, the AudioContext is likely
-  // dead and a rebuild is required. We can't rebuild here — visibilitychange
-  // is NOT a user gesture, so the fresh ctx would start 'suspended' and
-  // ctx.resume() would fail. Pause the UI to make it obvious the user needs
-  // to click play; togglePlay handles the rebuild inside that gesture stack.
-  if (Player.needsRebuild && current >= 0) {
-    try { Player.pause(); } catch {}
-  }
+  VisualAudioAnalysis.resume();
+  dlog('[audio] tab visible: state =', Player.state, 'analysis =', VisualAudioAnalysis.mode, 'paused =', Player.paused);
 }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') onTabVisible();
@@ -3305,6 +3727,8 @@ function frame() {
   let bass = 0, mid = 0, hi = 0, level = 0, spectralFlux = 0, waveRms = 0;
   let melodicPeak = 0, melodicEnergy = 0, melodicContrast = 0;
   const analyser = Player.analyser;
+  const activeTrack = tracks[current];
+  const analysis = visualAnalysisForTrack(activeTrack);
   if (analyser) {
     // Lower = more responsive to transients (less averaging with prior frames).
     // 0.55 keeps shader visuals readable while cutting ~150ms of perceived lag
@@ -3376,9 +3800,25 @@ function frame() {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, specTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 256, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, specBytes);
+  } else if (analysis && Player.hasBuffer) {
+    const sample = analysis.sample(Player.currentTime, specBytes);
+    bass = sample.bass;
+    mid = sample.mid;
+    hi = sample.hi;
+    level = sample.level;
+    spectralFlux = sample.spectralFlux;
+    waveRms = sample.waveRms;
+    melodicPeak = sample.melodicPeak;
+    melodicEnergy = sample.melodicEnergy;
+    melodicContrast = sample.melodicContrast;
+    freqData = specBytes;
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, specTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 256, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, specBytes);
   } else {
     // idle texture
     for (let i = 0; i < 256; i++) specBytes[i] = 0;
+    freqData = specBytes;
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, specTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 256, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, specBytes);
