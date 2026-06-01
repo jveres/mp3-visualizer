@@ -148,7 +148,7 @@ while dragging a playlist row so the HUD stays visible mid-reorder.
 - **Photos** — image Blobs and relative paths live in IndexedDB
   (`mvDB.images`). Survives reloads. Last-picked directory name is in
   `localStorage` (`mv.imgDir`).
-- **Toggles, effect selection, volume** — `localStorage` keys (`mv.shuf`,
+- **Toggles and effect selection** — `localStorage` keys (`mv.shuf`,
   `mv.loop`, `mv.autofx`, `mv.fx`).
 - **Welcome dialog opt-out, playlist hint** — `localStorage` keys
   (`mv.hideWelcome`, `mv.hasPlaylist`).

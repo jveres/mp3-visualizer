@@ -2402,7 +2402,6 @@ function parseId3v2(buf) {
   }
 
   const end = Math.min(totalSize, buf.length);
-  const frameIdLen = major >= 3 ? 4 : 3;
   const frameHdrLen = major >= 3 ? 10 : 6;
 
   while (pos + frameHdrLen <= end) {
@@ -2853,7 +2852,6 @@ function estimateBeatMap(audioBuffer) {
 
 const ANALYSIS_FPS = 30;
 const ANALYSIS_STRIDE = 9;
-const ANALYSIS_SPEC_BINS = 256;
 
 function fillAnalysisSpectrum(out, bass, mid, hi, level, flux, time) {
   const tick = Math.floor(time * 24);
@@ -2889,7 +2887,6 @@ function makeAnalysisObject(frameCount, duration, bands, beatMap = null) {
     frameCount,
     duration,
     bands,
-    spectra: null,
     beatMap,
     sample(time, outSpec) {
       const x = Math.max(0, Math.min(frameCount - 1, time * this.fps));
@@ -2909,19 +2906,7 @@ function makeAnalysisObject(frameCount, duration, bands, beatMap = null) {
       const melodicPeak = lerp(6) * fade;
       const melodicEnergy = lerp(7) * fade;
       const melodicContrast = lerp(8) * fade;
-      if (outSpec) {
-        const spectra = this.spectra;
-        const bins = ANALYSIS_SPEC_BINS;
-        const so0 = i0 * bins;
-        const so1 = i1 * bins;
-        if (spectra && spectra.length >= so1 + bins) {
-          for (let b = 0; b < bins; b++) {
-            outSpec[b] = spectra[so0 + b] + (spectra[so1 + b] - spectra[so0 + b]) * k;
-          }
-        } else {
-          fillAnalysisSpectrum(outSpec, bass, mid, hi, level, flux, time);
-        }
-      }
+      if (outSpec) fillAnalysisSpectrum(outSpec, bass, mid, hi, level, flux, time);
       return { bass, mid, hi, level, waveRms: rms, spectralFlux: flux, melodicPeak, melodicEnergy, melodicContrast };
     }
   };
@@ -3045,12 +3030,11 @@ function makeTrackAnalysis(audioBuffer) {
   return normalizeAnalysisBands(rawBands, frameCount, duration, estimateBeatMap(audioBuffer));
 }
 
-function ensurePreviewAnalysis(track, blob) {
+function ensurePreviewAnalysis(track) {
   if (!track.proceduralPreviewAnalysis) {
     track.proceduralPreviewAnalysis = makeProceduralPreviewAnalysis(track);
   }
-  if (!track.previewAnalysis) track.previewAnalysis = track.proceduralPreviewAnalysis;
-  return Promise.resolve(track.previewAnalysis);
+  return track.proceduralPreviewAnalysis;
 }
 
 function ensureTrackAnalysis(track, blob) {
@@ -3067,13 +3051,9 @@ function ensureTrackAnalysis(track, blob) {
   return track.analysisPromise;
 }
 
-function ensureBeatMap(track, blob) {
-  return ensureTrackAnalysis(track, blob);
-}
-
 function visualAnalysisForTrack(track) {
   if (!track) return null;
-  return track.analysis || track.proceduralPreviewAnalysis || track.previewAnalysis || null;
+  return track.analysis || track.proceduralPreviewAnalysis || null;
 }
 
 function activeBeatMap() {
@@ -3189,7 +3169,7 @@ async function playIndex(i, opts = {}) {
   renderPlaylist();
   const loadPromise = Player.loadBlob(blob);
   VisualAudioAnalysis.attach(Player.element, true);
-  ensurePreviewAnalysis(t, blob);
+  ensurePreviewAnalysis(t);
   primeTrackReactivity();
   Player.play();
   if (current !== i) return;
