@@ -38,9 +38,8 @@ routes through Web Audio, so browser-level `AudioContext` output failures
 cannot silence playback. When the browser supports media-element capture, a
 separate analyser reads a captured stream from the native element for live
 visuals without connecting that graph to speakers. If live capture is not
-available, visuals start from a lightweight preview signal immediately, then
-use MP3-frame preview data when it is ready. A decoded time-domain pass still
-supplies beat data and a fallback envelope.
+available, visuals start from a quiet preview signal immediately, then switch
+to decoded time-domain analysis when it is ready.
 
 ### Controls
 
@@ -169,8 +168,8 @@ Everything (apart from the Three.js CDN load used by Trails Stream) is in
 - Playback and visuals are intentionally decoupled. The native audio element
   owns sound output; Web Audio only analyzes captured or decoded data and is
   never connected to the audible output path. When live capture is not
-available, a procedural/MP3-frame preview starts the visual motion right away,
-  and a later decoded envelope pass estimates RMS, flux, and beats.
+  available, a quiet procedural preview avoids a frozen screen while a decoded
+  envelope pass estimates bands, RMS, flux, and beats from the real waveform.
 - Per-frame shader uniforms include `uBass`, `uMid`, `uHi`, `uLevel` (smoothed
   bands), plus `uBeat` (transient envelope), `uBeatT` (seconds since last
   beat) and `uPulse` — a velocity-based clock that surges on beats, used by
